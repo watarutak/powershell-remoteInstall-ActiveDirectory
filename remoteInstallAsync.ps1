@@ -1,4 +1,4 @@
-﻿# Arg0 = Computer name or Computer list
+# Arg0 = Computer name or Computer list
 # Arg1 = Installer name
 # Arg2 = Silent install option
 
@@ -42,13 +42,35 @@ $LocalExecPath = $LocalTargetBase + $LocalExecName
 $LocalInstallerPath = $LocalTargetBase + $InstallerName
 
 # Define result code
-set -name RESULT_SUCCESS -value 1 -option constant
-set -name RESULT_FALSE -value 0 -option constant
-set -name RESULT_YET -value 3 -option constant
+set -name JOB_RESULT_COMPLETED -value "Completed" -option constant
+
+set -name JOB_RESULT_RUNNING -value "Running" -option constant
+set -name JOB_RESULT_SUSPENDING -value "Suspending" -option constant
+set -name JOB_RESULT_STOPPING -value "Stopping" -option constant
+
+set -name JOB_RESULT_NOTSTARTED -value "NotStarted" -option constant
+set -name JOB_RESULT_FAILED -value "Failed" -option constant
+set -name JOB_RESULT_STOPPED -value "Stopped" -option constant
+set -name JOB_RESULT_BLOCKED -value "Blocked" -option constant
+set -name JOB_RESULT_SUSPENDED -value "Suspended" -option constant
+set -name JOB_RESULT_DISCONNECTED -value "Disconnected" -option constant
+
+$ary_success = @($JOB_RESULT_COMPLETED)
+$ary_running = @($JOB_RESULT_RUNNING, $JOB_RESULT_SUSPENDING, $JOB_STOPPING)
+$ary_fail = @($JOB_RESULT_NOTSTARTED, $JOB_RESULT_FAILED, $JOB_RESULT_STOPPED, $JOB_RESULT_BLOCKED, $JOB_RESULT_SUSPENDED, $JOB_RESULT_DISCONNECTED)
+
+# Define session state
+set -name SESSION_STATE_OPENED -value "Opened" -option constant
+set -name SESSION_STATE_DISCONNECTED -value "Disconnected" -option constant
+set -name SESSION_STATE_CLOSED -value "Closed" -option constant
+set -name SESSION_STATE_BROKEN -value "Broken" -option constant
+
+
+
 
 # Array for results
 $result = @()
-
+$checkCount = 0
 # Repeat installation for listed computers
 for ($i = 0; $i -lt $computers.Length; $i++) {
 
@@ -63,15 +85,13 @@ for ($i = 0; $i -lt $computers.Length; $i++) {
     try {
         # Open new session for target computer
         $s = New-PSSession -ComputerName $ret["computer"] -errorAction stop
-        # Store Session name
-
 
         # Delete if same name file exists in remote target folder
         if (Test-Path $UncBatPath) {
             Invoke-Command -Session $s -Scriptblock{del $args[0]} -ArgumentList $LocalExecPath -errorAction stop
         }
         if (Test-Path $UncInstallerPath) {
-            Invoke-Command -Session $s -Scriptblock{del $args[0]} -ArgumentList $LocalInstaller -errorAction stop
+            Invoke-Command -Session $s -Scriptblock{del $args[0]} -ArgumentList $LocalInstallerPath -errorAction stop
         }
 
         # Download installer and exec script to target computer
@@ -79,17 +99,15 @@ for ($i = 0; $i -lt $computers.Length; $i++) {
         Invoke-WebRequest -Uri $DownloadUrlInstaller -OutFile $UncInstallerPath -errorAction stop
 
         # Kick downloaded installer as a Background job
-        #Invoke-Command -Session $s -Scriptblock{C:\MIS_Temp\exec.cmd $args[0] $args[1]} -ArgumentList $InstallerName,$SilentOption -AsJob
-        #Invoke-Command -Session $s -Scriptblock{C:\MIS_Temp\installation.ps1 $args[0] $args[1]} -ArgumentList $InstallerName,$SilentOption -AsJob -errorAction stop
-        $jobName = $ret["computer"] + $InstallerName
-        Invoke-Command -Session $s -Scriptblock{ Start-Job -Name $args[0] -Scriptblock{C:\MIS_Temp\installation.ps1 $args[1] $args[2]}} -ArgumentList $jobName,$InstallerName,$SilentOption -errorAction stop
-        $ret.add("result",$RESULT_YET)
-
+        $job = Invoke-Command -Session $s -Scriptblock{ Start-Job -Scriptblock{C:\MIS_Temp\$args[0] $args[1]}} -ArgumentList $InstallerName,$SilentOption -errorAction stop
+        $ret.add("job", $job)
+        $ret.add("result",$job.State)
+        $checkCount++
     }
     catch
     {
         # Add error handling
-        $ret.add("result",$RESULT_FALSE)
+        $ret.add("result",$JOB_RESULT_FAILED)
         # Delete used files
         if (Test-Path $UncBatPath) {
             Invoke-Command -ComputerName $ret["computer"] -Scriptblock{del $args[0]} -ArgumentList $LocalExecPath
@@ -98,85 +116,77 @@ for ($i = 0; $i -lt $computers.Length; $i++) {
             Invoke-Command -ComputerName $ret["computer"] -Scriptblock{del $args[0]} -ArgumentList $LocalInstaller
         }
 
-        # 結果をテキストに出力 (False)
+        # Export result to text file
         $text = $ret["computer"] + " : " + "Failed`n"
         $text | Out-File $LogFile -Append
     }
     finally
     {
-        if ($s){
+        if ($s.State -eq $SESSION_STATE_OPENED){
             $s = Disconnect-PSSession -Session $s
-            $ret.add("session",$s)
         }
+        $ret.add("session",$s)
         $result += $ret
     }
 }
 
-# 結果確認ループ
-# 初期化
-$resultCount = 1
-while ($resultCount -ne 0) {
-    #結果確認
-    $resultCount = $result.Length
-    # 結果ファイル読み込み
-    $fileTexts = (Get-Content $LogFile) -as [string[]]
-    for ($i = 0;$i -lt $result.Length; $i++) {
-        if ($result[$i]["result"] -eq $RESULT_YET) {
-            #結果確認
-            Connect-PSSession -Session $result[$i]["session"]  # ターゲットコンピュータに再接続
-            # 結果取得
-            $jobName = $result[$i]["computer"] + $InstallerName
-            $jobResult = Invoke-Command -Session $result[$i]["session"] -ScriptBlock { Receive-Job -Name $args[0]} -ArgumentList $jobName
-            if (($jobResult -eq $RESULT_SUCCESS) -Or ($jobResult -eq $RESULT_FALSE)) {
-                # returnが1ならインストールされているプログラムの一覧にアプリ名とバージョンがあるか確認
-                $result[$i]["result"] = $jobResult
-                $resultCount--
+# Check result loop
+while ($checkCount -gt 0) {
 
-                # Delete finished files
-                Invoke-Command -Session $result[$i]["session"] -Scriptblock{del $args[0]} -ArgumentList $LocalExecPath
-                Invoke-Command -Session $result[$i]["session"] -Scriptblock{del $args[0]} -ArgumentList $LocalInstallerPath
+    # Check results
+    $checkCount = $result.Length
+    $fileTexts = @()
+    try {
+        for ($i = 0;$i -lt $result.Length; $i++) {
+           
+            if ($ary_running -contains $result[$i]["result"]) {
+                # Check result
+                Connect-PSSession -Session $result[$i]["session"]  # Reconnect to target computer
+                $result[$i]["result"] = Invoke-Command -Session $result[$i]["session"] -ScriptBlock{ Get-Job -Id $args[0]} -ArgumentList $result[$i]["job"].Id
 
-                if ($jobResult) {
-                    $resultText = $result[$i]["computer"] + " : " + "Success`n"
+                if (($ary_success -contains $result[$i]["result"].State) -Or ($ary_fail -contains $result[$i]["result"].State)) {
+                    # [TODO] If return is 1, check appication name and version are in list of installed programs 
+                   
+                    # Delete finished files
+                    Invoke-Command -Session $result[$i]["session"] -Scriptblock{del $args[0]} -ArgumentList $LocalExecPath
+                    Invoke-Command -Session $result[$i]["session"] -Scriptblock{del $args[0]} -ArgumentList $LocalInstallerPath
+
+                    # Remove PSSession
+                    Remove-PSSession -Session $result[$i]["session"]
+
+                    $checkCount--
                 } else {
-                    $resultText = $result[$i]["computer"] + " : " + "Failed`n"
+                    # Disconnect-PSSession
+                    Disconnect-PSSession -Session $result[$i]["session"]
                 }
-            } else {
-                $resultText = $result[$i]["computer"] + " : " + "Unknown`n"
-            }
 
-            # $fileTextsに$result[$i]["computer"] + " : " + "Unknown`n"が含まれていれば$resultTextと入れ替える
-            $unknown = $result[$i]["computer"] + " : " + "Unknown`n"
-            $flg = 0
-            for ($ii=0; $ii -lt $fileTexts.Length; $ii++) {
-                if ($fileTexts[$ii] -eq $unknown) {
-                    $fileTexts[$ii] = $resultText
-                    $flg = 1
+
+            } else {  # Target computers which finished checking result
+                # Delete session if it exists
+                if (($result[$i]["session"].State -eq $SESSION_STATE_OPENED) -Or ($result[$i]["session"].State -eq $SESSION_STATE_DISCONNECTED)) {
+                    Remove-PSSession -Session $result[$i]["session"]
                 }
-            }
-            if (!$flg) {
-              $fileTexts +=$resultText
+                $checkCount--
             }
 
-            # Disconnect-PSSession
-            Disconnect-PSSession -Session $result[$i]["session"]
+            # Create message for result file
+            $resultText = $result[$i]["computer"] + " : " + $result[$i]["result"].State + "`n"
+            $fileTexts += $resultText
 
-        } else {  # もう結果確認が終了したターゲットコンピュータ
-            # セッションがあれば削除
-            if ($result[$i]["session"]) {
-                Remove-PSSession -Session $result[$i]["session"]
-            }
-            $resultCount--
         }
     }
-
-    # 結果ファイルを一旦削除して作り直し
+    catch
+    {
+        Write-Host "error exits"
+    }
+ 
+    # Re-create result file after once delete
     Remove-Item $LogFile
     New-Item $LogFile -ItemType File
     for ($i=0; $i -lt $fileTexts.Length; $i++) {
         $fileTexts[$i] | Out-File $LogFile -Append
     }
 
-    # 次回確認までのWait処理 - 5分
-    Start-Sleep -Seconds 300
+    # Wait 5 min to next check loop
+    Start-Sleep -Seconds 10
 }

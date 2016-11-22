@@ -1,4 +1,4 @@
-﻿# Args[0]  installer name
+# Args[0]  installer name
 # Args[1]  silent install option
 
 $path = "./" + $Args[0]
